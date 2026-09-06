@@ -3,25 +3,22 @@ import pandas as pd
 import pdfplumber
 import re
 import io
-from fpdf import FPDF
+from xhtml2pdf import pisa
 
-st.set_page_config(page_title="מערכת O&M סולארית", layout="wide")
+st.set_page_config(page_title="מערכת O&M וקיזוז מצרפי סולארי", layout="wide")
 
-# CSS ליישור מושלם מימין לשמאל
 st.markdown("""
 <style>
-    .stApp { direction: rtl; text-align: right; }
-    h1, h2, h3, h4, p, span, div, label { direction: rtl; text-align: right !important; }
-    .stDataFrame { direction: rtl; }
-    [data-testid="stMetricValue"] { direction: ltr; text-align: right; }
+    .stApp { direction: rtl; }
+    h1, h2, h3, h4, p, span, div, label { text-align: right !important; }
+    .stDataFrame table { direction: rtl; width: 100%; }
+    div[data-testid="stMetricValue"] > div { text-align: right; direction: ltr; }
 </style>
 """, unsafe_allow_html=True)
 
 def parse_growatt_xls(file_bytes, filename):
-    """פענוח קובץ Growatt Year/Month Report תוך מיקום מדויק של חודשים 6, 7, 8"""
     text = ""
     try:
-        # קריאת כל הגליונות
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
         for sheet in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet)
@@ -29,19 +26,20 @@ def parse_growatt_xls(file_bytes, filename):
     except Exception:
         text = file_bytes.decode('latin-1', errors='ignore')
 
-    # חילוץ מספר סידורי של הממיר
     sn_match = re.search(r'(FVLJ[A-Z0-9]+|UMHS[A-Z0-9]+|UNHS[A-Z0-9]+|[A-Z0-9]{10,16})', text)
     sn = sn_match.group(1) if sn_match else "Growatt"
 
-    # חילוץ שורת חודשי השנה (12 חודשים)
-    # ב-Growatt מופיעים 12 ערכים לפי סדר החודשים ינואר-דצמבר
     all_floats = re.findall(r'\b\d{1,6}\.\d{1,2}\b', text)
     nums = [float(n) for n in all_floats if float(n) > 50.0]
 
-    # חילוץ ממוקד למתקני גבעת אלה אם מזוהים לפי SN או שם
     clean_name = filename.replace('.xls', '').replace('.xlsx', '').replace('(', '').replace(')', '').strip()
     
-    # ברירות מחדל מוכחות מהקובץ
+    display_name = clean_name
+    if "מזכיר" in clean_name: display_name = "מזכירות"
+    elif "ספורט" in clean_name: display_name = "אולם ספורט"
+    elif "נוער" in clean_name: display_name = "מועדון נוער"
+    elif "צרכני" in clean_name: display_name = "צרכניה"
+
     m6, m7, m8 = 0.0, 0.0, 0.0
     if "מזכיר" in clean_name or "UMHSEZ20AM" in sn:
         m6, m7, m8 = 6658.2, 8939.8, 7908.2
@@ -52,18 +50,15 @@ def parse_growatt_xls(file_bytes, filename):
     elif "צרכני" in clean_name or "UMHSEZ20AE" in sn:
         m6, m7, m8 = 5216.4, 6915.0, 1989.8
     else:
-        # חיפוש כללי: לוקחים 3 ערכים שאינם הסכום הכולל
         monthly_candidates = [n for n in nums if 500.0 < n < 35000.0]
         if len(monthly_candidates) >= 8:
-            # חודשים 6, 7, 8 נמצאים באינדקסים 5, 6, 7
             m6, m7, m8 = monthly_candidates[5], monthly_candidates[6], monthly_candidates[7]
         elif len(monthly_candidates) >= 3:
             m6, m7, m8 = monthly_candidates[0], monthly_candidates[1], monthly_candidates[2]
 
-    return {"name": clean_name, "sn": sn, "m1": m6, "m2": m7, "m3": m8}
+    return {"name": display_name, "sn": sn, "m1": m6, "m2": m7, "m3": m8}
 
 def parse_pvsyst_pdf(file_bytes, filename):
-    """פענוח נתוני PVsyst PDF"""
     text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -71,7 +66,6 @@ def parse_pvsyst_pdf(file_bytes, filename):
             if t:
                 text += t + "\n"
 
-    # חילוץ הספק DC מדויק
     kwp = 0.0
     kwp_match = re.search(r'Nominal\s*(?:STC|power)?[:\s]+([0-9]{2,4}(?:\.[0-9]+)?)\s*kWp', text, re.IGNORECASE)
     if not kwp_match:
@@ -79,10 +73,7 @@ def parse_pvsyst_pdf(file_bytes, filename):
     if kwp_match:
         kwp = float(kwp_match.group(1))
 
-    # חילוץ צפי חודשי
     june_exp, july_exp, aug_exp = 0.0, 0.0, 0.0
-    
-    # חיפוש לפי שם המתקן
     if "מזכיר" in filename or (45.0 <= kwp <= 48.0):
         kwp = 46.5
         june_exp, july_exp, aug_exp = 8151.9, 7830.7, 7232.8
@@ -103,88 +94,11 @@ def parse_pvsyst_pdf(file_bytes, filename):
 
     return {"kwp": kwp, "exp_june": june_exp, "exp_july": july_exp, "exp_aug": aug_exp}
 
-def build_pdf_report(project_name, period, tariff, sites, total_kwp, total_act, total_exp, total_diff, total_ratio, total_fin, notes_text):
-    pdf = FPDF(orientation='P', unit='mm', format='A4')
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    
-    pdf.set_font("Helvetica", style="B", size=16)
-    pdf.cell(0, 10, f"Solar O&M Executive Report - {project_name}", new_x="LMARGIN", new_y="NEXT", align="C")
-    
-    pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, f"Period: {period} | Tariff: {tariff} ILS/kWh", new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(4)
-    
-    # KPI Box
-    pdf.set_fill_color(240, 244, 248)
-    pdf.set_draw_color(43, 108, 176)
-    pdf.rect(10, pdf.get_y(), 190, 16, style="DF")
-    
-    pdf.set_xy(10, pdf.get_y() + 2)
-    pdf.set_font("Helvetica", style="B", size=8)
-    pdf.cell(47, 4, "Total DC Capacity", align="C")
-    pdf.cell(47, 4, "Total Actual Yield", align="C")
-    pdf.cell(47, 4, "Prorated Target", align="C")
-    pdf.cell(47, 4, "Portfolio Realization", align="C", new_x="LMARGIN", new_y="NEXT")
-    
-    pdf.set_font("Helvetica", style="B", size=11)
-    pdf.set_text_color(26, 54, 93)
-    pdf.cell(47, 7, f"{total_kwp:.1f} kWp", align="C")
-    pdf.cell(47, 7, f"{total_act:,.1f} kWh", align="C")
-    pdf.cell(47, 7, f"{total_exp:,.1f} kWh", align="C")
-    pdf.cell(47, 7, f"{total_ratio:.1f}%", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(7)
-    
-    # Table
-    pdf.set_font("Helvetica", style="B", size=8)
-    pdf.set_fill_color(26, 54, 93)
-    pdf.set_text_color(255, 255, 255)
-    
-    col_w = [38, 18, 26, 26, 26, 26, 30]
-    headers = ["Site Name", "kWp", "COD (Days)", "Target (kWh)", "Actual (kWh)", "Variance", "Financial Net"]
-    
-    for i, h in enumerate(headers):
-        pdf.cell(col_w[i], 7, h, border=1, fill=True, align="C")
-    pdf.ln()
-    
-    pdf.set_font("Helvetica", size=8)
-    pdf.set_text_color(0, 0, 0)
-    for s in sites:
-        pdf.cell(col_w[0], 6, str(s['name'])[:20], border=1, align="L")
-        pdf.cell(col_w[1], 6, f"{s['kwp']:.1f}", border=1, align="C")
-        pdf.cell(col_w[2], 6, f"{s['cod']} ({s['active_days']}d)", border=1, align="C")
-        pdf.cell(col_w[3], 6, f"{s['exp']:,.1f}", border=1, align="C")
-        pdf.cell(col_w[4], 6, f"{s['act']:,.1f}", border=1, align="C")
-        pdf.cell(col_w[5], 6, f"{s['diff']:+,.1f}", border=1, align="C")
-        pdf.cell(col_w[6], 6, f"{int(s['fin']):+,} ILS", border=1, align="C")
-        pdf.ln()
-        
-    pdf.set_font("Helvetica", style="B", size=8)
-    pdf.set_fill_color(235, 248, 255)
-    pdf.cell(col_w[0], 7, "Total Portfolio", border=1, fill=True, align="L")
-    pdf.cell(col_w[1], 7, f"{total_kwp:.1f}", border=1, fill=True, align="C")
-    pdf.cell(col_w[2], 7, "-", border=1, fill=True, align="C")
-    pdf.cell(col_w[3], 7, f"{total_exp:,.1f}", border=1, fill=True, align="C")
-    pdf.cell(col_w[4], 7, f"{total_act:,.1f}", border=1, fill=True, align="C")
-    pdf.cell(col_w[5], 7, f"{total_diff:+,.1f}", border=1, fill=True, align="C")
-    pdf.cell(col_w[6], 7, f"{int(total_fin):+,} ILS", border=1, fill=True, align="C")
-    pdf.ln(9)
-    
-    pdf.set_font("Helvetica", style="B", size=9)
-    pdf.cell(0, 5, "O&M Findings & Engineering Insights:", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", size=8)
-    pdf.multi_cell(0, 4.5, notes_text)
-    pdf.ln(8)
-    
-    pdf.set_font("Helvetica", size=8.5)
-    pdf.cell(60, 6, "Lead O&M Engineer: ________________", align="L")
-    pdf.cell(60, 6, "Date: ______________", align="C")
-    pdf.cell(70, 6, "Stamp & Signature: ________________", align="R")
-    
-    return bytes(pdf.output())
+def generate_pdf_bytes(html_content):
+    result = io.BytesIO()
+    pisa.CreatePDF(io.StringIO(html_content), dest=result, encoding='utf-8')
+    return result.getvalue()
 
-# כותרת ראשית
 st.title("☀️ מערכת O&M וקיזוז מצרפי סולארי")
 st.caption("מנוע אנליטי לסנכרון Growatt ו-PVsyst, חישוב ימי פעילות COD והפקת דוחות רשמיים")
 
@@ -210,11 +124,9 @@ if growatt_files:
     for f in growatt_files:
         g_data = parse_growatt_xls(f.read(), f.name)
         
-        # התאמת קובץ PVsyst לפי שם הקובץ
         matched_pvsyst = None
         if pvsyst_files:
             for pf in pvsyst_files:
-                # חיפוש מילה משותפת (למשל "מזכירות", "ספורט", "נוער", "צרכניה")
                 for token in ["ספורט", "מזכיר", "נוער", "צרכני"]:
                     if token in f.name and token in pf.name:
                         matched_pvsyst = parse_pvsyst_pdf(pf.getvalue(), pf.name)
@@ -223,7 +135,6 @@ if growatt_files:
                     break
         
         if not matched_pvsyst:
-            # ערכי תכנון הנדסיים מותאמים
             if "ספורט" in g_data["name"]:
                 matched_pvsyst = {"kwp": 149.0, "exp_june": 26611.4, "exp_july": 25598.1, "exp_aug": 23671.1}
             elif "מזכיר" in g_data["name"]:
@@ -235,7 +146,6 @@ if growatt_files:
             else:
                 matched_pvsyst = {"kwp": 50.0, "exp_june": 8500.0, "exp_july": 8200.0, "exp_aug": 7600.0}
 
-        # תאריכי הפעלה מסחרית (COD) וימי פעילות ביוני
         if "ספורט" in g_data["name"]:
             active_days_june = 23
             cod = "08/06/2026"
@@ -260,46 +170,48 @@ if growatt_files:
         fin_impact = round(diff * tariff, 0)
 
         sites.append({
+            "שם המתקן": g_data["name"],
+            "הספק (kWp)": f"{matched_pvsyst['kwp']:.1f}",
+            "תאריך הפעלה": cod,
+            "ימי יוני": active_days_june,
+            "יוני [kWh]": f"{g_data['m1']:,.1f}",
+            "יולי [kWh]": f"{g_data['m2']:,.1f}",
+            "אוגוסט [kWh]": f"{g_data['m3']:,.1f}",
+            "בפועל [kWh]": f"{tot_act:,.1f}",
+            "צפי מותאם [kWh]": f"{tot_exp:,.1f}",
+            "עודף/(חסר)": f"{diff:+,.1f}",
+            "עמידה ביעד": f"{ratio:.1f}%",
+            "משמעות כספית (₪)": f"{int(fin_impact):+,} ₪",
+            "_kwp": matched_pvsyst["kwp"],
+            "_act": tot_act,
+            "_exp": tot_exp,
+            "_diff": diff,
+            "_ratio": ratio,
+            "_fin": fin_impact,
             "name": g_data["name"],
             "kwp": matched_pvsyst["kwp"],
-            "inv": g_data["sn"],
             "cod": cod,
             "active_days": active_days_june,
-            "m1": g_data["m1"],
-            "m2": g_data["m2"],
-            "m3": g_data["m3"],
             "act": tot_act,
             "exp": tot_exp,
             "diff": diff,
-            "ratio": ratio,
             "fin": fin_impact
         })
 
 if sites:
-    df_display = pd.DataFrame(sites)
-    
     st.subheader("📊 טבלת קיזוז מצרפי מרוכזת (Portfolio Netting)")
-    st.dataframe(
-        df_display[["name", "kwp", "cod", "active_days", "m1", "m2", "m3", "act", "exp", "diff", "ratio", "fin"]].rename(columns={
-            "name": "מתקן",
-            "kwp": "הספק (kWp)",
-            "cod": "תאריך הפעלה",
-            "active_days": "ימי יוני",
-            "m1": "יוני [kWh]",
-            "m2": "יולי [kWh]",
-            "m3": "אוגוסט [kWh]",
-            "act": "בפועל [kWh]",
-            "exp": "צפי מותאם [kWh]",
-            "diff": "עודף/(חסר)",
-            "ratio": "עמידה ביעד (%)",
-            "fin": "משמעות כספית (₪)"
-        }),
-        use_container_width=True
-    )
+    cols_to_show = [
+        "שם המתקן", "הספק (kWp)", "תאריך הפעלה", "ימי יוני",
+        "יוני [kWh]", "יולי [kWh]", "אוגוסט [kWh]",
+        "בפועל [kWh]", "צפי מותאם [kWh]", "עודף/(חסר)",
+        "עמידה ביעד", "משמעות כספית (₪)"
+    ]
+    df_table = pd.DataFrame(sites)[cols_to_show]
+    st.table(df_table)
 
-    total_kwp = sum(s["kwp"] for s in sites)
-    total_act = sum(s["act"] for s in sites)
-    total_exp = sum(s["exp"] for s in sites)
+    total_kwp = sum(s["_kwp"] for s in sites)
+    total_act = sum(s["_act"] for s in sites)
+    total_exp = sum(s["_exp"] for s in sites)
     total_diff = total_act - total_exp
     total_ratio = (total_act / total_exp * 100) if total_exp > 0 else 0
     total_fin = total_diff * tariff
@@ -321,10 +233,87 @@ if sites:
     edited_notes = st.text_area("ערוך הערות לדוח במידת הצורך:", value=notes_text, height=120)
 
     if st.button("📄 הפק קובץ PDF להורדה"):
-        pdf_data = build_pdf_report(
-            project_name, period, tariff, sites, 
-            total_kwp, total_act, total_exp, total_diff, total_ratio, total_fin, edited_notes
-        )
+        rows_html = "".join([
+            f"<tr>"
+            f"<td style='text-align:right;'>{s['name']}</td>"
+            f"<td>{s['kwp']:.1f}</td>"
+            f"<td>{s['cod']} ({s['active_days']} ימים)</td>"
+            f"<td>{s['exp']:,.1f}</td>"
+            f"<td><b>{s['act']:,.1f}</b></td>"
+            f"<td style='color:{'#234E52' if s['diff'] >= 0 else '#9B2C2C'};'>{( '+' if s['diff'] >= 0 else '' )}{s['diff']:,.1f}</td>"
+            f"<td><b>{s['ratio']:.1f}%</b></td>"
+            f"<td style='color:{'#234E52' if s['fin'] >= 0 else '#9B2C2C'}; font-weight:bold;'>{( '+' if s['fin'] >= 0 else '' )}{int(s['fin']):,} ₪</td>"
+            f"</tr>"
+            for s in sites
+        ])
+
+        html_template = f"""
+        <!DOCTYPE html>
+        <html dir="rtl">
+        <head>
+          <meta charset="utf-8">
+          <style>
+            @page {{ size: a4 portrait; margin: 12mm; }}
+            body {{ font-family: Arial, Helvetica, sans-serif; direction: rtl; font-size: 10pt; color: #1A202C; }}
+            h1 {{ color: #1A365D; font-size: 16pt; margin: 0 0 4px 0; border-bottom: 2px solid #2B6CB0; padding-bottom: 4px; }}
+            .sub {{ color: #4A5568; font-size: 9pt; margin-bottom: 12px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 8.5pt; }}
+            th, td {{ border: 1px solid #CBD5E0; padding: 5px; text-align: center; }}
+            th {{ background-color: #1A365D; color: #ffffff; }}
+            .total-row {{ background-color: #EBF8FF; font-weight: bold; }}
+            .notes {{ background-color: #FFFDF5; border: 1px solid #FEEBC8; border-right: 4px solid #DD6B20; padding: 8px; margin-top: 14px; font-size: 8.5pt; }}
+            .sigs {{ margin-top: 25px; width: 100%; font-size: 8.5pt; }}
+          </style>
+        </head>
+        <body>
+          <h1>דו"ח תפעולי רבעוני וקיזוז מצרפי (O&M)</h1>
+          <div class="sub">{project_name} | {period} | נוהל רשות החשמל (נספח יד')</div>
+
+          <table>
+            <thead>
+              <tr>
+                <th style="text-align:right;">שם המתקן</th>
+                <th>הספק DC</th>
+                <th>מועד COD וימים</th>
+                <th>צפי מותאם [kWh]</th>
+                <th>בפועל [kWh]</th>
+                <th>עודף / (חסר)</th>
+                <th>עמידה ביעד</th>
+                <th>משמעות כספית</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows_html}
+              <tr class="total-row">
+                <td style="text-align:right;">סה"כ {project_name}</td>
+                <td>{total_kwp:.1f} kWp</td>
+                <td>-</td>
+                <td>{total_exp:,.1f}</td>
+                <td>{total_act:,.1f}</td>
+                <td>{( '+' if total_diff >= 0 else '' )}{total_diff:,.1f} kWh</td>
+                <td>{total_ratio:.1f}%</td>
+                <td>{( '+' if total_fin >= 0 else '' )}{int(total_fin):,} ₪</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="notes">
+            <b>ממצאי O&M ומסקנות הנדסיות:</b><br>
+            {edited_notes.replace(chr(10), '<br>')}
+          </div>
+
+          <table class="sigs" style="border:none; margin-top:30px;">
+            <tr style="border:none;">
+              <td style="border:none; text-align:right; width:33%;">מהנדס בודק / מנהל O&M:<br><br>____________________</td>
+              <td style="border:none; text-align:center; width:33%;">תאריך חתימה:<br><br>____________________</td>
+              <td style="border:none; text-align:left; width:33%;">חתימה וחותמת:<br><br>____________________</td>
+            </tr>
+          </table>
+        </body>
+        </html>
+        """
+
+        pdf_data = generate_pdf_bytes(html_template)
         st.download_button(
             label="⬇️ לחץ להורדת קובץ ה-PDF",
             data=pdf_data,
